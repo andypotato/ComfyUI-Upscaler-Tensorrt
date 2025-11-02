@@ -173,54 +173,55 @@ class Engine:
         timing_cache=None,
         update_output_names=None,
     ):
-        p = [Profile()]
-        if input_profile:
-            p = [Profile() for i in range(len(input_profile))]
-            for _p, i_profile in zip(p, input_profile):
-                for name, dims in i_profile.items():
-                    assert len(dims) == 3
-                    _p.add(name, min=dims[0], opt=dims[1], max=dims[2])
-
-        config_kwargs = {}
-        if not enable_all_tactics:
-            config_kwargs["tactic_sources"] = []
-
-        network = network_from_onnx_path(
-            onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]
-        )
-        if update_output_names:
-            print(f"Updating network outputs to {update_output_names}")
-            network = ModifyNetworkOutputs(network, update_output_names)
-
-        builder = network[0]
-        config = builder.create_builder_config()
-        config.progress_monitor = TQDMProgressMonitor()
-
-        config.set_flag(trt.BuilderFlag.FP16) if fp16 else None
-        config.set_flag(trt.BuilderFlag.REFIT) if enable_refit else None
-
-        profiles = copy.deepcopy(p)
-        for profile in profiles:
-            # Last profile is used for set_calibration_profile.
-            calib_profile = profile.fill_defaults(network[1]).to_trt(
-                builder, network[1]
-            )
-            config.add_optimization_profile(calib_profile)
+        """
+        Builds a TensorRT engine for one or more STATIC profiles.
+        """
+        if not input_profile:
+            error("Engine build failed: No input profile provided.")
+            return 1
 
         try:
-            engine = engine_from_network(
-                network,
-                config,
+            network = network_from_onnx_path(
+                onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]
             )
+            if update_output_names:
+                network = ModifyNetworkOutputs(network, update_output_names)
+
+            builder = network[0]
+            config = builder.create_builder_config()
+            config.progress_monitor = TQDMProgressMonitor()
+            
+            # Static profile logic
+            for p in input_profile:
+                profile = Profile()
+                for name, dims in p.items():
+                    if not isinstance(dims, (list, tuple)) or len(dims) != 4:
+                        error(f"Static profile shape must be a 4-element list/tuple (N,C,H,W). Got: {dims}")
+                        return 1
+                    # Set min, opt, and max to the *same* static shape
+                    profile.add(name, min=dims, opt=dims, max=dims)
+                
+                calib_profile = profile.fill_defaults(network[1]).to_trt(builder, network[1])
+                config.add_optimization_profile(calib_profile)
+
+            if fp16:
+                config.set_flag(trt.BuilderFlag.FP16)
+            if enable_refit:
+                config.set_flag(trt.BuilderFlag.REFIT)
+            
+            # WSL2/Docker performance fix: limit tactic sources
+            if not enable_all_tactics:
+                # Cast to int to fix the '|' operand error
+                config.set_tactic_sources(int(trt.TacticSource.CUBLAS) | int(trt.TacticSource.CUDNN))
+
+            engine = engine_from_network(network, config)
+            save_engine(engine, path=self.engine_path)
+            
+            return 0 # Return 0 for success
+
         except Exception as e:
             error(f"Failed to build engine: {e}")
-            return 1
-        try:
-            save_engine(engine, path=self.engine_path)
-        except Exception as e:
-            error(f"Failed to save engine: {e}")
-            return 1
-        return 0
+            return 1 # Return 1 for failure
 
     def load(self):
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
@@ -234,6 +235,7 @@ class Engine:
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
         nvtx.range_push("allocate_buffers")
+        
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
             binding = self.engine[idx]
@@ -249,16 +251,24 @@ class Engine:
                 tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]
             ).to(device=device)
             self.tensors[binding] = tensor
+        
+        # Performance fix: Bind tensors once during allocation
+        nvtx.range_push("bind_tensors")
+        for name, tensor in self.tensors.items():
+            self.context.set_tensor_address(name, tensor.data_ptr())
+        nvtx.range_pop()
+        
         nvtx.range_pop()
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
         nvtx.range_push("set_tensors")
         for name, buf in feed_dict.items():
-            self.tensors[name].copy_(buf)
+            # Performance fix: Asynchronous copy
+            self.tensors[name].copy_(buf, non_blocking=True)
 
-        for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
+        # Performance fix: Removed the set_tensor_address loop
         nvtx.range_pop()
+        
         nvtx.range_push("execute")
         noerror = self.context.execute_async_v3(stream)
         if not noerror:
