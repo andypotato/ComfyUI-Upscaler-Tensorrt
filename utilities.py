@@ -101,39 +101,43 @@ def download_file(url, save_path):
             progress_bar.update(size)
 
 def get_final_resolutions(width, height, resize_to):
-    final_width = None
-    final_height = None
-    aspect_ratio = float(width/height)
+    """
+    Calculates the final target resolution, preserving the original aspect ratio
+    by fitting the 4x upscale into the target resolution "box".
+    """
+    # 1. Get the 4x upscaled (native) resolution
+    native_width = width * 4
+    native_height = height * 4
+    
+    if resize_to == "none":
+        return (native_width, native_height)
 
-    match resize_to:
-        case "HD":
-            final_width = 1280
-            final_height = 720
-        case "FHD":
-            final_width = 1920
-            final_height = 1080
-        case "2k":
-            final_width = 2560
-            final_height = 1440
-        case "4k":
-            final_width = 3840
-            final_height = 2160
-        case "none":
-            final_width = width*4
-            final_height = height*4
-        case "2x":
-            final_width = width*2
-            final_height = height*2
-        case "3x":
-            final_width = width*3
-            final_height = height*3
+    # 2. Get the target "box" dimensions
+    target_w, target_h = None, None
+    if resize_to == "HD":
+        target_w, target_h = 1280, 720
+    elif resize_to == "FHD":
+        target_w, target_h = 1920, 1080
+    elif resize_to == "2k":
+        target_w, target_h = 2560, 1440
+    elif resize_to == "4k":
+        target_w, target_h = 3840, 2160
+    elif resize_to == "2x":
+        target_w, target_h = width * 2, height * 2
+    elif resize_to == "3x":
+        target_w, target_h = width * 3, height * 3
+    else:
+        # Fallback for "none" or unknown
+        return (native_width, native_height)
 
-    if aspect_ratio == 1.0:
-        final_width = final_height
+    # 3. Calculate the downscale ratio to fit inside the box
+    # We must pick the *smaller* ratio to ensure it fits
+    ratio_w = target_w / native_width
+    ratio_h = target_h / native_height
+    ratio = min(ratio_w, ratio_h)
 
-    if aspect_ratio < 1.0 and resize_to not in ("none", "2x", "3x"):
-        temp = final_width
-        final_width = final_height
-        final_height = temp
+    # 4. Calculate final size
+    final_width = round(native_width * ratio)
+    final_height = round(native_height * ratio)
 
     return (final_width, final_height)
